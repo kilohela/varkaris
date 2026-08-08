@@ -1,17 +1,32 @@
 # AGENTS.md
 
-## Zig 使用原则
+## Zig usage principles
 
-1. **逐步小步实现，每步确认后再继续**。不要一次铺开大改动；先完成一个可验证的小步骤，向用户说明并等待确认，再进入下一步。
+1. **Implement in small verifiable steps, confirm with the user before moving
+   on**. Don't roll out large changes at once; complete one small verifiable
+   step, explain it, and wait for confirmation before the next one.
 
-2. **Terminal / 系统调用相关 API 必须先查 stdlib 源码确认再写**。本项目使用 Zig 0.16，stdlib API 与传统写法差异大（如 `std.ArrayList` 的 allocator 参数化、union 字面量语法等），不要凭记忆或旧版本经验写；动手前先看 `/usr/lib/zig/std/` 下的源码确认签名与行为。
+2. **Terminal / syscall-related APIs must be verified against the stdlib
+   source before writing code**. This project uses Zig 0.16, whose stdlib API
+   differs greatly from older conventions. Don't write from memory or older
+   versions; check the signatures and behavior in source code first.
 
-3. **硬件/内核行为不确定时，先做实证验证再实现**。例如内核结构体字段名（BTF）、设备号语义、tty 行为等，优先从内核 BTF、`/sys`、`stat` 等实际来源确认，避免臆测。
+3. **When hardware/kernel behavior is uncertain, verify empirically before
+   implementing**. For example, kernel struct field names (BTF), device number
+   semantics, tty behavior — confirm from actual sources such as kernel BTF,
+   `/sys`, `stat`, avoiding speculation.
 
-4. **构建产物缓存感知输入变化**：`build.zig` 中编译外部源文件（如 clang 编译 BPF 程序）必须用 `addFileArg` 注册输入，否则缓存不失效、装出旧产物。
+4. **Build cache must be sensitive to input changes**: when `build.zig`
+   compiles external source files (e.g. clang-compiled BPF programs), inputs
+   must be registered with `addFileArg`, otherwise the cache won't
+   invalidate and stale artifacts get installed.
 
-## 项目速览
+## Project overview
 
-- 终端透传（镜像）：TIOCSTI 注入输入 + eBPF fentry 捕获 `n_tty_write` 输出，Zig 用户态 + C/clang 编译的 BPF 程序（CO-RE，`SEC("fentry/n_tty_write")` 自动 attach）。
-- `src/filter.zig`：镜像输出选择性过滤（内置极简 VT 序列状态机，丢弃查询/协商序列）+ 输入侧 kitty 键盘事件解码，测试用 `zig build test`。
-- 前缀键 Ctrl+6（0x1e），`x` 退出（tmux 式）。
+- Terminal pass-through (mirror): TIOCSTI input injection + eBPF capture of
+  `n_tty_write` output, Zig userspace + BPF program compiled with C/clang
+  (CO-RE, `SEC("fentry/n_tty_write")` auto-attach).
+- `src/filter.zig`: selective filtering of mirrored output (built-in minimal
+  VT sequence state machine, drops query/negotiation sequences) + kitty
+  keyboard event decoding on the input side; tested with `zig build test`.
+- Prefix key Ctrl+6 (0x1e), `x` exits (tmux-style).
