@@ -12,6 +12,6 @@
 
 ## 项目速览
 
-- 终端透传（镜像）：TIOCSTI 注入输入 + eBPF kprobe 捕获 `n_tty_write` 输出，Zig 用户态 + C/clang 编译的 BPF 程序（CO-RE）。
+- 终端透传（镜像）：TIOCSTI 注入输入 + eBPF fentry 捕获 `n_tty_write` 输出，Zig 用户态 + C/clang 编译的 BPF 程序（CO-RE，`SEC("fentry/n_tty_write")` 自动 attach）。
 - `src/filter.zig`：镜像输出选择性过滤（内置极简 VT 序列状态机，丢弃查询/协商序列）+ 输入侧 kitty 键盘事件解码，测试用 `zig build test`。
 - 前缀键 Ctrl+6（0x1e），`x` 退出（tmux 式）。

@@ -1,5 +1,6 @@
-// kprobe 程序：捕获 n_tty_write 的写入内容并送入 ring buffer。
-// CO-RE 编译（clang -target bpf -g -O2），结构体偏移在加载时由内核 BTF 解析。
+// fentry 程序：捕获 n_tty_write 的写入内容并送入 ring buffer。
+// CO-RE 编译（clang -target bpf -g -O2）：参数由 BPF_PROG 宏按 BTF 签名
+// 直接获取（不再读 pt_regs），结构体字段偏移在加载时由内核 BTF 解析。
 #define __TARGET_ARCH_x86
 #include <stddef.h>
 #include <linux/bpf.h>
@@ -18,33 +19,6 @@ struct tty_struct {
 struct tty_driver {
     int major;
     int minor_start;
-} __attribute__((preserve_access_index));
-
-// x86_64 pt_regs，字段偏移由 CO-RE 从内核 BTF 解析。
-// 注意：内核视图字段名是 ax/cx/dx/si/di（asm/ptrace.h），
-// 不是用户态视图的 rax/rcx/rdx/rsi/rdi。
-struct pt_regs {
-    __u64 r15;
-    __u64 r14;
-    __u64 r13;
-    __u64 r12;
-    __u64 rbp;
-    __u64 rbx;
-    __u64 r11;
-    __u64 r10;
-    __u64 r9;
-    __u64 r8;
-    __u64 ax;
-    __u64 cx;
-    __u64 dx;
-    __u64 si;
-    __u64 di;
-    __u64 orig_ax;
-    __u64 ip;
-    __u64 cs;
-    __u64 flags;
-    __u64 sp;
-    __u64 ss;
 } __attribute__((preserve_access_index));
 
 // 目标 tty 的设备号（rdev major/minor，statx 原样写入）。
@@ -73,14 +47,14 @@ struct event {
     __u8 data[MAX_COPY];
 };
 
-SEC("kprobe/n_tty_write")
-int capture_tty_write(struct pt_regs *ctx)
+// fentry 挂 n_tty_write：参数签名与内核 BTF 一致
+// （static ssize_t n_tty_write(struct tty_struct *tty, struct file *file,
+//                              const u8 *buf, size_t nr)）。
+SEC("fentry/n_tty_write")
+int BPF_PROG(capture_tty_write, struct tty_struct *tty, struct file *file,
+             const unsigned char *buf, size_t nr)
 {
-    // n_tty_write(struct tty_struct *tty, struct file *file, const u8 *buf, size_t nr)
-    // 直接读内核 pt_regs 字段（CO-RE 解析偏移），不依赖 PT_REGS_PARM 宏。
-    struct tty_struct *tty = (struct tty_struct *)ctx->di;
-    const unsigned char *buf = (const unsigned char *)ctx->dx;
-    size_t nr = ctx->cx;
+    (void)file;
 
     __u32 key = 0;
     struct target_dev_value *target = bpf_map_lookup_elem(&target_dev, &key);

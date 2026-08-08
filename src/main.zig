@@ -136,7 +136,7 @@ pub fn main(init: std.process.Init) !void {
     raw.cc[@intFromEnum(posix.V.TIME)] = 0;
     try posix.tcsetattr(stdin_handle, .NOW, raw);
 
-    // ---- 加载 BPF 对象并挂载 kprobe ----
+    // ---- 加载 BPF 对象并挂载 fentry ----
 
     // BPF 对象路径：与可执行文件同目录。
     const exe_path = args[0];
@@ -173,7 +173,7 @@ pub fn main(init: std.process.Init) !void {
     try checkErr(bpf_map__update_elem(target_dev, &key, 4, &target_dev_value, 8, 0), "target_dev 写入");
     std.log.info("目标 tty: major={d} minor={d}", .{ st.rdev_major, st.rdev_minor });
 
-    // 挂 kprobe（libbpf 按 SEC("kprobe/n_tty_write") 自动挂载）。
+    // 挂 fentry（libbpf 按 SEC("fentry/n_tty_write") 自动走 bpf_program__attach_trace）。
     const prog: *bpf_program = @ptrCast(try checkObj(
         bpf_object__find_program_by_name(obj, "capture_tty_write"),
         "find_program_by_name",
