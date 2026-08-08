@@ -16,9 +16,12 @@
 //!   OSC 的 '?' 查询（OSC 11;?、OSC 52;c;? 等）、kitty 键盘协议查询（CSI ? u）
 //! - 协商/改输入模式类：kitty 键盘协议开启（CSI > u）、modifyOtherKeys
 //!   （CSI > 4 m）、鼠标追踪（CSI ? 1000-1006/1015/1016/9 h）、
-//!   focus 报告（CSI ? 1004 h）、kitty graphics（APC "G"）——这些会让
-//!   我们的终端应答或改变输入编码/产生事件流，转发进受控端会造成
-//!   duplicate 或受控端无法解析的输入格式。
+//!   focus 报告（CSI ? 1004 h）——这些会让我们的终端应答或改变输入编码/
+//!   产生事件流，转发进受控端会造成 duplicate 或受控端无法解析的输入格式。
+//! - kitty graphics 查询（APC "G" 负载以 "q=" 开头）：受控端程序会从
+//!   受控端 tty 的真实 master 收到应答，我们的终端应答再注入会造成重复；
+//!   kitty graphics 图片数据序列（其余 APC "G"）是纯渲染指令，与 sixel
+//!   一样原样透传。
 //!
 //! 序列识别用内联的极简状态机实现（vt100.net DEC ANSI 解析器的子集，
 //! 只保留区分上述规则所需的部分）：ground / escape / csi / dcs / osc / apc，
@@ -118,6 +121,8 @@ pub const Filter = struct {
     dcs_done: bool = false,
     /// APC 是否处于第一个负载字节（kitty graphics 探测）。
     apc_first: bool = false,
+    /// kitty graphics 探测进度：0 = 无，1 = 已见 'G' 等 'q'，2 = 已见 'Gq' 等 '='。
+    apc_probe: u8 = 0,
 
     pub fn init(alloc: std.mem.Allocator) Filter {
         return .{
@@ -128,6 +133,13 @@ pub const Filter = struct {
 
     pub fn deinit(self: *Filter) void {
         self.pending.deinit(self.alloc);
+    }
+
+    /// 当前是否处于 ground 且无丢弃状态（无挂起序列）。
+    /// 调用方可据此走快速路径：不含序列起始字节（ESC/C1）的数据块
+    /// 可直接整体转发，无需逐字节过状态机（图片 base64 大块提速用）。
+    pub fn isIdle(self: *const Filter) bool {
+        return self.state == .ground and !self.dropping;
     }
 
     /// 返回需要写入我们终端的字节切片（指向内部缓存，下次 push 前有效），
@@ -210,6 +222,7 @@ pub const Filter = struct {
     fn enterApc(self: *Filter) void {
         self.state = .apc;
         self.apc_first = true;
+        self.apc_probe = 0;
     }
 
     fn stepEscape(self: *Filter, c: u8) void {
@@ -379,8 +392,10 @@ pub const Filter = struct {
     }
 
     fn stepApc(self: *Filter, c: u8) void {
-        // 第一个负载字节：探测 kitty graphics。
-        // 7-bit 形式已有 ESC _（2 字节），8-bit 形式已有 0x9f（1 字节）。
+        // 探测 kitty graphics：负载以 "q=" 开头是查询（丢弃，避免我们的终端
+        // 应答与受控端真实 master 的应答重复注入）；其余（图片数据、控制命令）
+        // 是纯渲染指令，原样透传。7-bit 前缀 ESC _（2 字节）或 8-bit 前缀
+        // 0x9f（1 字节）已在 pending 中。
         if (self.apc_first) {
             self.apc_first = false;
             const n = self.pending.items.len; // 尚未包含 c
@@ -388,11 +403,24 @@ pub const Filter = struct {
                 self.pending.items[1] == '_') or
                 (n == 1 and self.pending.items[0] == 0x9f)))
             {
-                // kitty graphics：丢弃整个负载
-                self.forward = false;
-                self.dropping = true;
-                self.pending.items.len = 0;
-                return;
+                self.apc_probe = 1; // 已见 'G'，等 'q'
+            }
+        } else if (self.apc_probe != 0) {
+            if (self.apc_probe == 1) {
+                if (c == 'q') {
+                    self.apc_probe = 2; // 已见 'Gq'，等 '='
+                } else {
+                    self.apc_probe = 0; // 图片数据，转发
+                }
+            } else {
+                // 已见 'Gq'
+                if (c == '=') {
+                    // kitty graphics 查询：丢弃整个序列
+                    self.forward = false;
+                    self.dropping = true;
+                    self.pending.items.len = 0;
+                }
+                self.apc_probe = 0;
             }
         }
         switch (c) {
@@ -725,15 +753,23 @@ test "丢弃：输入模式协商" {
     try expectDrop("\x1b[>2;3u"); // kitty push 多参数
 }
 
-test "丢弃：kitty graphics" {
-    try expectDrop("\x1b_Gf=32,s=10;AAAA\x1b\\");
-    try expectDrop("\x9fGf=32,s=10;AAAA\x9c");
-    try expectDrop("\x1b_Ga;b\x1b\\\x1b_Gc;d\x1b\\");
+test "丢弃：kitty graphics 查询" {
+    try expectDrop("\x1b_Gq=1\x1b\\");
+    try expectDrop("\x1b_Gq=2\x1b\\");
+    try expectDrop("\x1b_Gq=1;s=10\x1b\\");
+    try expectDrop("\x9fGq=1\x9c");
 }
 
-test "丢弃：kitty graphics 不影响周围内容" {
-    try expectOut("前\x1b_Gf=32;AAAA\x1b\\后", "前后");
-    try expectOut("a\x1b_Gx;y\x1b\\b\x1b_Gz;w\x1b\\c", "abc");
+test "转发：kitty graphics 图片数据" {
+    try expectForward("\x1b_Gf=32,s=10;AAAA\x1b\\");
+    try expectForward("\x9fGf=32,s=10;AAAA\x9c");
+    try expectForward("\x1b_Ga=f,f=32,s=10,v=10,m=1;AAAA\x1b\\\x1b_Gm=0;BBBB\x1b\\");
+    try expectForward("\x1b_Ga;b\x1b\\\x1b_Gc;d\x1b\\");
+}
+
+test "kitty graphics 查询丢弃不影响周围内容" {
+    try expectOut("前\x1b_Gq=1\x1b\\后", "前后");
+    try expectOut("a\x1b_Gq=1\x1b\\b\x1b_Gq=2\x1b\\c", "abc");
 }
 
 test "序列合并：中止后接新序列按整体分类" {

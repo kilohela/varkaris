@@ -34,12 +34,18 @@ struct {
     __type(value, struct target_dev_value);
 } target_dev SEC(".maps");
 
-// 输出事件。
+// 输出事件。16MB：容纳约 4000 个 4KB 事件（单次 chafa 6.7MB 图
+// ≈ 3300 个事件），传输全程缓冲，即使消费稍慢也不丢。
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 20);
+    __uint(max_entries, 1 << 24);
 } events SEC(".maps");
 
+// 单次 n_tty_write 的最大长度：tty 写路径（iterate_tty_write）把用户
+// 写入分块后调用 n_tty_write，默认 chunk=2048，TTY_NO_WRITE_SPLIT 时
+// 才 65536（物理 console 不设该标志，实测事件均为 2048）。
+// 事件固定大小（bpf_ringbuf_reserve 的 size 必须是编译期常量），
+// 4096 覆盖默认 chunk 并留余量。
 #define MAX_COPY 4096
 
 struct event {
@@ -47,21 +53,27 @@ struct event {
     __u8 data[MAX_COPY];
 };
 
-// fentry 挂 n_tty_write：参数签名与内核 BTF 一致
-// （static ssize_t n_tty_write(struct tty_struct *tty, struct file *file,
-//                              const u8 *buf, size_t nr)）。
-SEC("fentry/n_tty_write")
-int BPF_PROG(capture_tty_write, struct tty_struct *tty, struct file *file,
-             const unsigned char *buf, size_t nr)
+// fexit 挂 n_tty_write：fentry 捕获的是"请求写入量"nr，但物理 console
+// 输出慢导致 n_tty_write 部分写，iterate_tty_write 会退回重试——同一
+// 数据多次进入 n_tty_write，按 nr 捕获会重复数倍（实测 6.7MB vs
+// chafa 实际输出 1.96MB）。
+// 这里显式读取 fexit ctx（避免 BPF_PROG 宏展开歧义）：
+// ctx[0]=tty, ctx[1]=file, ctx[2]=buf, ctx[3]=nr, ctx[4]=ret(实际写入量)。
+// 读 buf[0..ret] 即真实输出数据（fexit 在函数返回前触发，write_buf
+// 尚未被下一次 copy_from_iter 覆盖）。
+SEC("fexit/n_tty_write")
+int capture_tty_write_exit(unsigned long long *ctx)
 {
-    (void)file;
+    struct tty_struct *tty = (struct tty_struct *)(void *)ctx[0];
+    const unsigned char *buf = (const unsigned char *)(void *)ctx[2];
+    long ret = (long)ctx[4];
 
     __u32 key = 0;
     struct target_dev_value *target = bpf_map_lookup_elem(&target_dev, &key);
 
     if (!target)
         return 0;
-    if (nr == 0)
+    if (ret <= 0)
         return 0;
 
     // 按设备号过滤：major 来自 tty->driver->major；minor 不能直接比 tty->index，
@@ -72,7 +84,8 @@ int BPF_PROG(capture_tty_write, struct tty_struct *tty, struct file *file,
     if (BPF_CORE_READ(tty, driver, minor_start) + BPF_CORE_READ(tty, index) != target->minor)
         return 0;
 
-    __u32 len = nr < MAX_COPY ? (__u32)nr : MAX_COPY;
+    // 单事件提交实际写入的数据（ret <= nr <= 2048 默认 chunk）。
+    __u32 len = ret < MAX_COPY ? (__u32)ret : MAX_COPY;
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(struct event), 0);
     if (!e)
         return 0;

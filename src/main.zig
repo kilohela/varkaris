@@ -19,6 +19,18 @@ const PREFIX_TIMEOUT_MS: i32 = 1000;
 /// 否则 vim 里 ESC 后的第一个键会被当成序列字节吞掉。
 const ESC_TIMEOUT_MS: i32 = 50;
 
+/// 非交互模式（-c <command>）的运行时长（ms）：注入命令后镜像转发
+/// 该时长，然后自动退出。
+const CMD_TIMEOUT_MS: i64 = 5000;
+
+/// 单调时钟当前毫秒（非交互模式计时用）。
+fn nowMs() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 +
+        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
 // ---- libbpf 绑定（手写 extern，避免 @cImport）----
 
 const bpf_object = opaque {};
@@ -36,7 +48,6 @@ extern fn bpf_object__find_program_by_name(obj: *const bpf_object, name: [*:0]co
 extern fn bpf_object__find_map_by_name(obj: *const bpf_object, name: [*:0]const u8) ?*bpf_map;
 extern fn bpf_program__attach(prog: *bpf_program) ?*bpf_link;
 extern fn bpf_map__update_elem(map: *const bpf_map, key: *const anyopaque, key_sz: usize, value: *const anyopaque, value_sz: usize, flags: u64) c_int;
-extern fn bpf_map__lookup_elem(map: *const bpf_map, key: *const anyopaque, key_sz: usize, value: *anyopaque, value_sz: usize, flags: u64) c_int;
 extern fn bpf_map__fd(map: *const bpf_map) c_int;
 extern fn ring_buffer__new(map_fd: c_int, sample_cb: RingSampleFn, ctx: ?*anyopaque, opts: ?*const anyopaque) ?*ring_buffer;
 extern fn ring_buffer__consume(rb: *ring_buffer) c_int;
@@ -55,16 +66,88 @@ const State = struct {
     filter: *filter_mod.Filter,
 };
 
+/// 写镜像字节到 stdout（阻塞流式）。
+fn writeStdout(io: Io, bytes: []const u8) bool {
+    Io.File.writeStreamingAll(Io.File.stdout(), io, bytes) catch return false;
+    return true;
+}
+
+/// 序列起始字节（与 filter.zig 的 isStarter 一致）：数据块含任一字节时
+/// 必须逐字节过状态机，否则可整体转发。
+fn isStarterByte(b: u8) bool {
+    return b == 0x1b or b == 0x9b or b == 0x90 or b == 0x9d or b == 0x98 or
+        b == 0x9e or b == 0x9f;
+}
+
+fn hasStarter(bytes: []const u8) bool {
+    for (bytes) |b| {
+        if (isStarterByte(b)) return true;
+    }
+    return false;
+}
+
 /// ring buffer 回调：把被控 tty 的输出经过滤后写到自己的终端。
+/// filter 输出按批量累积（连续独立字节/短序列合并成块）再一次性写出，
+/// 避免大输出（图片等）时每字节一次小写拖慢消费、ring 满丢数据。
+/// 快速路径：filter 空闲且数据块不含序列起始字节（图片 base64 大块）
+/// 时直接整体累积，跳过逐字节状态机。
 fn onRingSample(ctx: ?*anyopaque, data: ?*const anyopaque, size: usize) callconv(.c) c_int {
     _ = size;
     const state: *State = @ptrCast(@alignCast(ctx.?));
     const event: *const Event = @ptrCast(@alignCast(data.?));
     const bytes = event.data[0..@intCast(event.len)];
-    for (bytes) |b| {
-        if (state.filter.push(b)) |slice| {
-            Io.File.writeStreamingAll(Io.File.stdout(), state.io, slice) catch return -1;
+
+    var out: [8192]u8 = undefined;
+    var out_len: usize = 0;
+    const append_out = struct {
+        fn append(io: Io, buf: *[8192]u8, len: *usize, slice: []const u8) bool {
+            if (len.* + slice.len > buf.len) {
+                if (!writeStdout(io, buf[0..len.*])) return false;
+                len.* = 0;
+                // 大 slice（图片大单块等整序列）：直接写出，不经缓冲
+                if (slice.len > buf.len) {
+                    if (!writeStdout(io, slice)) return false;
+                    return true;
+                }
+            }
+            @memcpy(buf[len.*..][0..slice.len], slice);
+            len.* += slice.len;
+            return true;
         }
+    }.append;
+
+    // 分段处理：纯文本段（不含序列起始字节）在 filter 空闲时整体批量
+    // 直通（一次 memcpy），序列段才逐字节过状态机——图片数据每事件仅
+    // 含 2-3 个 ESC，逐字节 push 从 ~2048 次降到 ~30 次，消费提速数十倍。
+    var start: usize = 0;
+    while (start < bytes.len) {
+        var esc = start;
+        while (esc < bytes.len and !isStarterByte(bytes[esc])) esc += 1;
+        if (esc > start) {
+            if (state.filter.isIdle()) {
+                if (!append_out(state.io, &out, &out_len, bytes[start..esc])) return -1;
+            } else {
+                for (bytes[start..esc]) |b| {
+                    if (state.filter.push(b)) |slice| {
+                        if (!append_out(state.io, &out, &out_len, slice)) return -1;
+                    }
+                }
+            }
+        }
+        if (esc >= bytes.len) break;
+        var j = esc;
+        while (j < bytes.len) {
+            const b = bytes[j];
+            if (state.filter.push(b)) |slice| {
+                if (!append_out(state.io, &out, &out_len, slice)) return -1;
+            }
+            j += 1;
+            if (state.filter.isIdle()) break;
+        }
+        start = j;
+    }
+    if (out_len > 0) {
+        if (!writeStdout(state.io, out[0..out_len])) return -1;
     }
     return 0;
 }
@@ -112,8 +195,11 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len != 2) {
-        std.log.err("用法: sudo {s} <tty slave 路径> （Ctrl+6 后按 x 退出；Ctrl+6 Ctrl+6 发送字面 Ctrl+6）", .{args[0]});
+    var command: ?[]const u8 = null;
+    if (args.len == 4 and std.mem.eql(u8, args[2], "-c")) {
+        command = args[3]; // 非交互：自动在受控端执行命令后退出
+    } else if (args.len != 2) {
+        std.log.err("用法: sudo {s} <tty slave 路径> [-c <命令>]", .{args[0]});
         std.process.exit(2);
     }
     const tty_path = args[1];
@@ -172,9 +258,9 @@ pub fn main(init: std.process.Init) !void {
     try checkErr(bpf_map__update_elem(target_dev, &key, 4, &target_dev_value, 8, 0), "target_dev 写入");
     std.log.debug("目标 tty: major={d} minor={d}", .{ st.rdev_major, st.rdev_minor });
 
-    // 挂 fentry（libbpf 按 SEC("fentry/n_tty_write") 自动走 bpf_program__attach_trace）。
+    // 挂 fexit（libbpf 按 SEC("fexit/n_tty_write") 自动走 bpf_program__attach_trace）。
     const prog: *bpf_program = @ptrCast(try checkObj(
-        bpf_object__find_program_by_name(obj, "capture_tty_write"),
+        bpf_object__find_program_by_name(obj, "capture_tty_write_exit"),
         "find_program_by_name",
     ));
     const link: *bpf_link = @ptrCast(try checkObj(bpf_program__attach(prog), "bpf_program__attach"));
@@ -187,12 +273,22 @@ pub fn main(init: std.process.Init) !void {
     ));
     var out_filter = filter_mod.Filter.init(arena);
     defer out_filter.deinit();
+
     var state = State{ .io = io, .filter = &out_filter };
+
     const rb: *ring_buffer = @ptrCast(try checkObj(
         ring_buffer__new(bpf_map__fd(events_map), onRingSample, &state, null),
         "ring_buffer__new",
     ));
     defer ring_buffer__free(rb);
+
+    // 非交互模式：注入命令 + 回车（\r）到受控端，开始计时。
+    var start_ms: i64 = 0;
+    if (command) |cmd| {
+        try injectBytes(tty, io, cmd);
+        try injectBytes(tty, io, "\r");
+        start_ms = nowMs();
+    }
 
     // ---- 主循环：poll stdin（注入，tmux 式前缀）+ poll ringbuf（回显）----
 
@@ -209,9 +305,17 @@ pub fn main(init: std.process.Init) !void {
     };
 
     while (true) {
-        const timeout_ms: i32 = if (prefix_wait) PREFIX_TIMEOUT_MS
+        var timeout_ms: i32 = if (prefix_wait) PREFIX_TIMEOUT_MS
         else if (input_dec.pending()) ESC_TIMEOUT_MS
         else -1;
+        if (command != null) {
+            // 非交互：poll 分段超时（最长 1s），到 CMD_TIMEOUT_MS 自动退出。
+            const elapsed = nowMs() - start_ms;
+            const remain = CMD_TIMEOUT_MS - elapsed;
+            if (remain <= 0) break;
+            const cap: i32 = @intCast(@min(remain, 1000));
+            timeout_ms = if (timeout_ms < 0 or timeout_ms > cap) cap else timeout_ms;
+        }
         const nfds = posix.poll(&fds, timeout_ms) catch continue;
 
         // 超时：prefix 单独按下，或 ESC/残缺序列挂起 → 独立转发
