@@ -1,7 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
 const posix = std.posix;
-const builtin = @import("builtin");
 const filter_mod = @import("filter.zig");
 
 /// TIOCSTI: 伪造一个字符注入到 tty 的输入队列（等价于键盘输入）。
@@ -175,7 +174,7 @@ pub fn main(init: std.process.Init) !void {
     var target_dev_value = [_]u32{ st.rdev_major, st.rdev_minor };
     var key: u32 = 0;
     try checkErr(bpf_map__update_elem(target_dev, &key, 4, &target_dev_value, 8, 0), "target_dev 写入");
-    std.log.info("目标 tty: major={d} minor={d}", .{ st.rdev_major, st.rdev_minor });
+    std.log.debug("目标 tty: major={d} minor={d}", .{ st.rdev_major, st.rdev_minor });
 
     // 挂 fentry（libbpf 按 SEC("fentry/n_tty_write") 自动走 bpf_program__attach_trace）。
     const prog: *bpf_program = @ptrCast(try checkObj(
@@ -237,9 +236,8 @@ pub fn main(init: std.process.Init) !void {
 
             const ev = input_dec.push(b);
 
-            if (comptime builtin.mode == .Debug) {
-                std.log.info("stdin: {x:0>2} -> {s} prefix_wait={any}", .{ b, @tagName(ev), prefix_wait });
-            }
+            // debug 级日志：Debug 模式默认输出，Release 模式被编译期剪掉
+            std.log.debug("stdin: {x:0>2} -> {s} prefix_wait={any}", .{ b, @tagName(ev), prefix_wait });
 
             switch (ev) {
                 .prefix => |bytes| {
