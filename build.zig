@@ -4,14 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // 用 clang 编译 BPF kprobe 程序（CO-RE），产物安装到 zig-out/bin。
+    // 用 clang 编译 BPF fentry 程序（CO-RE），产物安装到源码树 src/ 下，
+    // 供 @embedFile 直接嵌入可执行文件（单一二进制）。
     // 注意：源码必须用 addFileArg 注册为输入，zig 缓存才能感知变化并重编译。
     const clang_cmd = b.addSystemCommand(&.{
         "clang", "-target", "bpf", "-g", "-O2", "-c",
     });
     clang_cmd.addFileArg(b.path("src/probe.bpf.c"));
     const bpf_obj = clang_cmd.addPrefixedOutputFileArg("-o", "probe.bpf.o");
-    const install_bpf = b.addInstallFile(bpf_obj, "bin/probe.bpf.o");
+    const install_bpf = b.addInstallFileWithDir(bpf_obj, .{ .custom = ".." }, "src/probe.bpf.o");
     b.getInstallStep().dependOn(&install_bpf.step);
 
     const exe = b.addExecutable(.{
@@ -23,6 +24,8 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    // @embedFile 读取 src/probe.bpf.o，必须等安装步骤先落盘
+    exe.step.dependOn(&install_bpf.step);
     exe.root_module.linkSystemLibrary("bpf", .{});
     b.installArtifact(exe);
 

@@ -29,7 +29,7 @@ const ring_buffer = opaque {};
 
 const RingSampleFn = *const fn (ctx: ?*anyopaque, data: ?*const anyopaque, size: usize) callconv(.c) c_int;
 
-extern fn bpf_object__open_file(path: [*:0]const u8, opts: ?*const anyopaque) ?*bpf_object;
+extern fn bpf_object__open_mem(obj_buf: [*]const u8, obj_buf_sz: usize, opts: ?*const anyopaque) ?*bpf_object;
 extern fn bpf_object__load(obj: *bpf_object) c_int;
 extern fn bpf_object__close(obj: *bpf_object) void;
 extern fn bpf_object__find_program_by_name(obj: *const bpf_object, name: [*:0]const u8) ?*bpf_program;
@@ -141,15 +141,11 @@ pub fn main(init: std.process.Init) !void {
 
     // ---- 加载 BPF 对象并挂载 fentry ----
 
-    // BPF 对象路径：与可执行文件同目录。
-    const exe_path = args[0];
-    const dir_end = std.mem.lastIndexOfScalar(u8, exe_path, '/') orelse return error.BadExePath;
-    const obj_path = try std.mem.concat(arena, u8, &.{ exe_path[0 .. dir_end + 1], "probe.bpf.o" });
-    const obj_path_z = try arena.dupeZ(u8, obj_path);
-
+    // BPF 对象：编译期嵌入（@embedFile，build.zig 的 addEmbedPath 提供搜索路径）。
+    const bpf_bytes = @embedFile("probe.bpf.o");
     const obj: *bpf_object = @ptrCast(try checkObj(
-        bpf_object__open_file(obj_path_z.ptr, null),
-        "bpf_object__open_file",
+        bpf_object__open_mem(bpf_bytes.ptr, bpf_bytes.len, null),
+        "bpf_object__open_mem",
     ));
     defer bpf_object__close(obj);
 
