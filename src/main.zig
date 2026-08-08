@@ -3,27 +3,30 @@ const Io = std.Io;
 const posix = std.posix;
 const filter_mod = @import("filter.zig");
 
-/// TIOCSTI: 伪造一个字符注入到 tty 的输入队列（等价于键盘输入）。
-/// 定义来自内核头文件 /usr/include/asm-generic/ioctls.h，stdlib 未收录。
+/// TIOCSTI: forge a character into the tty input queue (equivalent to a key press).
+/// Defined in the kernel header /usr/include/asm-generic/ioctls.h, not in stdlib.
 const TIOCSTI: u32 = 0x5412;
 
-/// 输入前缀键（tmux 式）：Ctrl+6 = 0x1e（ASCII RS）。
-/// 终端应答序列不含 0x1e，且镜像路径已过滤应答来源，不会误触。
+/// Input prefix key (tmux-style): Ctrl+6 = 0x1e (ASCII RS).
+/// Terminal responses never contain 0x1e, and the mirror path filters out
+/// response sources, so this cannot be triggered accidentally.
 const PREFIX: u8 = 0x1e;
-/// 前缀后按 x 退出（仿 tmux 的 detach 语义）。
+/// Pressing x after the prefix exits (tmux detach semantics).
 const EXIT_KEY: u8 = 'x';
-/// 前缀等待下一个键的超时（ms），超时则把 prefix 本身转发给受控端。
+/// Timeout waiting for the key after the prefix (ms); on timeout the prefix
+/// itself is forwarded to the controlled tty.
 const PREFIX_TIMEOUT_MS: i32 = 1000;
-/// 挂起字节（ESC 等 '['、残缺 CSI 序列）的极短超时（ms）：转义序列的
-/// 字节流间隔远小于人类按键间隔，超时说明 ESC 是独立按键，转发它。
-/// 否则 vim 里 ESC 后的第一个键会被当成序列字节吞掉。
+/// Very short timeout for held-back bytes (ESC waiting for '[', partial CSI
+/// sequences) in ms: escape sequence bytes arrive far faster than human
+/// keystrokes, so a timeout means ESC was a standalone keypress — forward it.
+/// Otherwise the first key after ESC in vim would be swallowed as sequence bytes.
 const ESC_TIMEOUT_MS: i32 = 50;
 
-/// 非交互模式（-c <command>）的运行时长（ms）：注入命令后镜像转发
-/// 该时长，然后自动退出。
+/// Runtime of non-interactive mode (-c <command>) in ms: inject the command,
+/// mirror-forward output for this duration, then exit.
 const CMD_TIMEOUT_MS: i64 = 5000;
 
-/// 单调时钟当前毫秒（非交互模式计时用）。
+/// Current time in milliseconds on the monotonic clock (for non-interactive mode).
 fn nowMs() i64 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
@@ -31,7 +34,7 @@ fn nowMs() i64 {
         @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
 }
 
-// ---- libbpf 绑定（手写 extern，避免 @cImport）----
+// ---- libbpf bindings (hand-written externs, avoiding @cImport) ----
 
 const bpf_object = opaque {};
 const bpf_program = opaque {};
@@ -55,7 +58,7 @@ extern fn ring_buffer__epoll_fd(rb: *const ring_buffer) c_int;
 extern fn ring_buffer__free(rb: *ring_buffer) void;
 extern fn libbpf_strerror(err: c_int, buf: [*]u8, size: usize) c_int;
 
-/// ring buffer 中的事件，与 probe.bpf.c 的 struct event 对应。
+/// Event in the ring buffer, matching struct event in probe.bpf.c.
 const Event = extern struct {
     len: u32,
     data: [4096]u8,
@@ -66,14 +69,15 @@ const State = struct {
     filter: *filter_mod.Filter,
 };
 
-/// 写镜像字节到 stdout（阻塞流式）。
+/// Write mirrored bytes to stdout (blocking, streaming).
 fn writeStdout(io: Io, bytes: []const u8) bool {
     Io.File.writeStreamingAll(Io.File.stdout(), io, bytes) catch return false;
     return true;
 }
 
-/// 序列起始字节（与 filter.zig 的 isStarter 一致）：数据块含任一字节时
-/// 必须逐字节过状态机，否则可整体转发。
+/// Sequence starter bytes (matches isStarter in filter.zig): if a data chunk
+/// contains any of these it must go through the state machine byte by byte,
+/// otherwise it can be forwarded as a whole.
 fn isStarterByte(b: u8) bool {
     return b == 0x1b or b == 0x9b or b == 0x90 or b == 0x9d or b == 0x98 or
         b == 0x9e or b == 0x9f;
@@ -86,11 +90,14 @@ fn hasStarter(bytes: []const u8) bool {
     return false;
 }
 
-/// ring buffer 回调：把被控 tty 的输出经过滤后写到自己的终端。
-/// filter 输出按批量累积（连续独立字节/短序列合并成块）再一次性写出，
-/// 避免大输出（图片等）时每字节一次小写拖慢消费、ring 满丢数据。
-/// 快速路径：filter 空闲且数据块不含序列起始字节（图片 base64 大块）
-/// 时直接整体累积，跳过逐字节状态机。
+/// Ring buffer callback: filter the controlled tty's output and write it to
+/// our own terminal. Filter output is accumulated in batches (consecutive
+/// plain bytes / short sequences merged into chunks) and written out once,
+/// avoiding per-byte small writes on large output (images etc.) that would
+/// slow consumption and overflow the ring.
+/// Fast path: when the filter is idle and the chunk contains no sequence
+/// starter bytes (large image base64 blocks), accumulate it as a whole,
+/// skipping the byte-by-byte state machine.
 fn onRingSample(ctx: ?*anyopaque, data: ?*const anyopaque, size: usize) callconv(.c) c_int {
     _ = size;
     const state: *State = @ptrCast(@alignCast(ctx.?));
@@ -104,7 +111,8 @@ fn onRingSample(ctx: ?*anyopaque, data: ?*const anyopaque, size: usize) callconv
             if (len.* + slice.len > buf.len) {
                 if (!writeStdout(io, buf[0..len.*])) return false;
                 len.* = 0;
-                // 大 slice（图片大单块等整序列）：直接写出，不经缓冲
+                // Large slice (whole sequence, e.g. a big image chunk): write
+                // it out directly without buffering.
                 if (slice.len > buf.len) {
                     if (!writeStdout(io, slice)) return false;
                     return true;
@@ -116,9 +124,11 @@ fn onRingSample(ctx: ?*anyopaque, data: ?*const anyopaque, size: usize) callconv
         }
     }.append;
 
-    // 分段处理：纯文本段（不含序列起始字节）在 filter 空闲时整体批量
-    // 直通（一次 memcpy），序列段才逐字节过状态机——图片数据每事件仅
-    // 含 2-3 个 ESC，逐字节 push 从 ~2048 次降到 ~30 次，消费提速数十倍。
+    // Segmented processing: plain-text segments (no sequence starter bytes)
+    // pass through in bulk while the filter is idle (one memcpy); sequence
+    // segments go through the state machine byte by byte. Image events contain
+    // only 2-3 ESC bytes each, so per-byte pushes drop from ~2048 to ~30,
+    // speeding up consumption by an order of magnitude.
     var start: usize = 0;
     while (start < bytes.len) {
         var esc = start;
@@ -152,7 +162,7 @@ fn onRingSample(ctx: ?*anyopaque, data: ?*const anyopaque, size: usize) callconv
     return 0;
 }
 
-/// 把一个字节注入受控端 tty 的输入队列。
+/// Inject one byte into the controlled tty's input queue.
 fn injectByte(tty: Io.File, io: Io, b: u8) !void {
     var buf = [_]u8{b};
     const result = try io.operate(.{
@@ -163,19 +173,19 @@ fn injectByte(tty: Io.File, io: Io, b: u8) !void {
         },
     });
     if (result.device_io_control < 0) {
-        std.log.err("TIOCSTI 注入失败: {}", .{result.device_io_control});
+        std.log.err("TIOCSTI injection failed: {}", .{result.device_io_control});
         std.process.exit(1);
     }
 }
 
-/// 批量注入（TIOCSTI 一次一个字节）。
+/// Inject multiple bytes (TIOCSTI takes one byte per call).
 fn injectBytes(tty: Io.File, io: Io, bytes: []const u8) !void {
     for (bytes) |b| try injectByte(tty, io, b);
 }
 
 fn checkObj(ptr: ?*anyopaque, what: []const u8) !*anyopaque {
     if (ptr == null) {
-        std.log.err("libbpf: {s} 失败", .{what});
+        std.log.err("libbpf: {s} failed", .{what});
         return error.LibbpfFailed;
     }
     return ptr.?;
@@ -185,7 +195,7 @@ fn checkErr(rc: c_int, what: []const u8) !void {
     if (rc < 0) {
         var buf: [256]u8 = undefined;
         _ = libbpf_strerror(rc, &buf, buf.len);
-        std.log.err("libbpf: {s} 失败: {s}", .{ what, std.mem.sliceTo(&buf, 0) });
+        std.log.err("libbpf: {s} failed: {s}", .{ what, std.mem.sliceTo(&buf, 0) });
         return error.LibbpfFailed;
     }
 }
@@ -197,21 +207,22 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
     var command: ?[]const u8 = null;
     if (args.len == 4 and std.mem.eql(u8, args[2], "-c")) {
-        command = args[3]; // 非交互：自动在受控端执行命令后退出
+        command = args[3]; // non-interactive: run a command on the controlled tty then exit
     } else if (args.len != 2) {
-        std.log.err("用法: sudo {s} <tty slave 路径> [-c <命令>]", .{args[0]});
+        std.log.err("usage: sudo {s} <tty slave path> [-c <command>]", .{args[0]});
         std.process.exit(2);
     }
     const tty_path = args[1];
 
-    // 打开目标 tty 的 slave 文件（物理 tty 或 pts）。
+    // Open the target tty's slave file (physical tty or pts).
     const tty = try Io.Dir.openFileAbsolute(io, tty_path, .{
         .mode = .read_write,
     });
     defer Io.File.close(tty, io);
 
-    // 控制台（自己的 stdin）：保存原始 termios，交互模式改为非规范模式、
-    // 关闭回显与 ISIG（否则 Ctrl+C 变 SIGINT），defer 还原。
+    // Our console (stdin): save the original termios, switch to non-canonical
+    // mode with echo and ISIG off (otherwise Ctrl+C becomes SIGINT) in
+    // interactive mode; restore on exit.
     const stdin_handle = posix.STDIN_FILENO;
     const orig_term = try posix.tcgetattr(stdin_handle);
     defer posix.tcsetattr(stdin_handle, .NOW, orig_term) catch {};
@@ -219,15 +230,16 @@ pub fn main(init: std.process.Init) !void {
     var raw = orig_term;
     raw.lflag.ICANON = false;
     raw.lflag.ECHO = false;
-    raw.lflag.ISIG = false; // 否则 Ctrl+C 会被终端驱动转为 SIGINT 杀掉本程序
-    raw.iflag.ICRNL = false; // 否则回车 \r 会被内核转为 \n
-    raw.cc[@intFromEnum(posix.V.MIN)] = 1; // 有数据就返回
+    raw.lflag.ISIG = false; // otherwise Ctrl+C is turned into SIGINT by the terminal driver
+    raw.iflag.ICRNL = false; // otherwise the terminal driver converts \r to \n
+    raw.cc[@intFromEnum(posix.V.MIN)] = 1; // return as soon as data is available
     raw.cc[@intFromEnum(posix.V.TIME)] = 0;
     try posix.tcsetattr(stdin_handle, .NOW, raw);
 
-    // ---- 加载 BPF 对象并挂载 fentry ----
+    // ---- Load the BPF object and attach the fentry program ----
 
-    // BPF 对象：编译期嵌入（@embedFile，build.zig 的 addEmbedPath 提供搜索路径）。
+    // BPF object embedded at compile time (@embedFile; build.zig provides the
+    // search path via addInstallFileWithDir).
     const bpf_bytes = @embedFile("probe.bpf.o");
     const obj: *bpf_object = @ptrCast(try checkObj(
         bpf_object__open_mem(bpf_bytes.ptr, bpf_bytes.len, null),
@@ -235,10 +247,11 @@ pub fn main(init: std.process.Init) !void {
     ));
     defer bpf_object__close(obj);
 
-    // 加载程序（map 在此刻于内核中创建）。
+    // Load the program (maps are created in the kernel at this point).
     try checkErr(bpf_object__load(obj), "bpf_object__load");
 
-    // 用 statx 获取目标 tty 的设备号（major/index），写入过滤 map。
+    // Get the target tty's device number (major/minor) via statx and write it
+    // into the filter map.
     const tty_path_z = try arena.dupeZ(u8, tty_path);
     var st: std.os.linux.Statx = undefined;
     if (std.os.linux.errno(std.os.linux.statx(
@@ -255,10 +268,11 @@ pub fn main(init: std.process.Init) !void {
     ));
     var target_dev_value = [_]u32{ st.rdev_major, st.rdev_minor };
     var key: u32 = 0;
-    try checkErr(bpf_map__update_elem(target_dev, &key, 4, &target_dev_value, 8, 0), "target_dev 写入");
-    std.log.debug("目标 tty: major={d} minor={d}", .{ st.rdev_major, st.rdev_minor });
+    try checkErr(bpf_map__update_elem(target_dev, &key, 4, &target_dev_value, 8, 0), "target_dev update");
+    std.log.debug("target tty: major={d} minor={d}", .{ st.rdev_major, st.rdev_minor });
 
-    // 挂 fexit（libbpf 按 SEC("fexit/n_tty_write") 自动走 bpf_program__attach_trace）。
+    // Attach the fexit program (libbpf picks bpf_program__attach_trace
+    // automatically from SEC("fexit/n_tty_write")).
     const prog: *bpf_program = @ptrCast(try checkObj(
         bpf_object__find_program_by_name(obj, "capture_tty_write_exit"),
         "find_program_by_name",
@@ -266,7 +280,7 @@ pub fn main(init: std.process.Init) !void {
     const link: *bpf_link = @ptrCast(try checkObj(bpf_program__attach(prog), "bpf_program__attach"));
     _ = link;
 
-    // ring buffer 消费。
+    // Ring buffer consumption.
     const events_map: *bpf_map = @ptrCast(try checkObj(
         bpf_object__find_map_by_name(obj, "events"),
         "find_map_by_name(events)",
@@ -282,7 +296,8 @@ pub fn main(init: std.process.Init) !void {
     ));
     defer ring_buffer__free(rb);
 
-    // 非交互模式：注入命令 + 回车（\r）到受控端，开始计时。
+    // Non-interactive mode: inject command + carriage return (\r) into the
+    // controlled tty and start the timer.
     var start_ms: i64 = 0;
     if (command) |cmd| {
         try injectBytes(tty, io, cmd);
@@ -290,13 +305,13 @@ pub fn main(init: std.process.Init) !void {
         start_ms = nowMs();
     }
 
-    // ---- 主循环：poll stdin（注入，tmux 式前缀）+ poll ringbuf（回显）----
+    // ---- Main loop: poll stdin (injection, tmux-style prefix) + poll ringbuf (mirror) ----
 
     const stdin_file = Io.File.stdin();
     var buf: [1]u8 = undefined;
     var input_dec = filter_mod.Input{};
     var prefix_wait = false;
-    var prefix_bytes: [64]u8 = undefined; // kitty 事件负载最长 64 字节
+    var prefix_bytes: [64]u8 = undefined; // kitty event payloads are at most 64 bytes
     var prefix_len: usize = 0;
 
     var fds = [_]posix.pollfd{
@@ -309,7 +324,7 @@ pub fn main(init: std.process.Init) !void {
         else if (input_dec.pending()) ESC_TIMEOUT_MS
         else -1;
         if (command != null) {
-            // 非交互：poll 分段超时（最长 1s），到 CMD_TIMEOUT_MS 自动退出。
+            // Non-interactive: cap poll timeout (max 1s); exit at CMD_TIMEOUT_MS.
             const elapsed = nowMs() - start_ms;
             const remain = CMD_TIMEOUT_MS - elapsed;
             if (remain <= 0) break;
@@ -318,7 +333,8 @@ pub fn main(init: std.process.Init) !void {
         }
         const nfds = posix.poll(&fds, timeout_ms) catch continue;
 
-        // 超时：prefix 单独按下，或 ESC/残缺序列挂起 → 独立转发
+        // Timeout: the prefix was pressed alone, or ESC / a partial sequence
+        // is pending -> forward independently.
         if (nfds == 0) {
             if (prefix_wait) {
                 prefix_wait = false;
@@ -336,12 +352,13 @@ pub fn main(init: std.process.Init) !void {
 
             const ev = input_dec.push(b);
 
-            // debug 级日志：Debug 模式默认输出，Release 模式被编译期剪掉
+            // Debug-level log: printed by default in Debug builds, compiled
+            // away in Release builds.
             std.log.debug("stdin: {x:0>2} -> {s} prefix_wait={any}", .{ b, @tagName(ev), prefix_wait });
 
             switch (ev) {
                 .prefix => |bytes| {
-                    // Ctrl+6：进入前缀等待（或双击 = 字面转发）
+                    // Ctrl+6: enter prefix wait (or a second press = literal forward)
                     if (prefix_wait) {
                         prefix_wait = false;
                         try injectBytes(tty, io, bytes);
@@ -352,15 +369,16 @@ pub fn main(init: std.process.Init) !void {
                     }
                 },
                 .key => |k| {
-                    // kitty 键事件（普通键原样转发）
+                    // kitty key event (ordinary keys forwarded verbatim)
                     if (prefix_wait) {
-                        if (k.code == EXIT_KEY and (k.mods & 4) == 0) break; // 前缀后按 x 退出
-                        prefix_wait = false; // 其余键：prefix 被吞，只转发该键
+                        if (k.code == EXIT_KEY and (k.mods & 4) == 0) break; // prefix then x exits
+                        prefix_wait = false; // other keys: prefix is swallowed, only the key is forwarded
                     }
                     try injectBytes(tty, io, k.payload);
                 },
                 .forward => |bytes| {
-                    // 普通字节/非 kitty 序列（原样转发；raw 模式下的 x 在等待态退出）
+                    // Ordinary bytes / non-kitty sequences (verbatim; in raw
+                    // mode x while waiting exits)
                     if (prefix_wait) {
                         if (bytes.len == 1 and bytes[0] == EXIT_KEY) break;
                         prefix_wait = false;
@@ -376,7 +394,8 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-// Zig 0.16 的测试只执行根文件的 test 块，必须显式引用模块才能跑其中的测试。
+// Zig 0.16 only runs test blocks in the root file; the module must be
+// referenced explicitly for its tests to run.
 test {
     _ = @import("filter.zig");
 }
