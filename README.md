@@ -22,7 +22,7 @@ Dependencies: Zig 0.16, clang (to compile the BPF program), libbpf, kernel BTF
 (CO-RE).
 
 ```sh
-zig build
+zig build --release=safe
 zig build test   # filter unit tests
 ```
 
