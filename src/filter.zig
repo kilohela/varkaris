@@ -19,42 +19,66 @@
 //!   focus 报告（CSI ? 1004 h）、kitty graphics（APC "G"）——这些会让
 //!   我们的终端应答或改变输入编码/产生事件流，转发进受控端会造成
 //!   duplicate 或受控端无法解析的输入格式。
+//!
+//! 序列识别用内联的极简状态机实现（vt100.net DEC ANSI 解析器的子集，
+//! 只保留区分上述规则所需的部分）：ground / escape / csi / dcs / osc / apc，
+//! 整个序列缓存到 pending，回到 ground 时按缓存的决定整体转发或丢弃。
 
 const std = @import("std");
-const vt = @import("vt/Parser.zig");
-
 const log = std.log.scoped(.filter);
 
 /// 丢弃的 DECSET/DECRST 模式（'?' h/l）：会让我们的终端应答或产生输入事件流。
 const drop_modes = [_]u16{ 9, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2026 };
 
-fn contains(haystack: []const u8, needle: u8) bool {
-    return std.mem.indexOfScalar(u8, haystack, needle) != null;
+/// 状态机状态。
+const State = enum {
+    ground,
+    escape, // ESC 之后，等待下一个字节
+    csi,
+    dcs, // 头部（等待 final）或负载（dcs_done 区分）
+    osc,
+    apc, // APC/PM/SOS 字符串
+};
+
+/// CSI 内部子状态：决定 0x3c-0x3f（'<='>?'）与 ':' 是私有标记还是非法字节。
+const CsiSub = enum { entry, param, intermediate, ignore };
+
+/// 中间符掩码：0x20-0x3f 的位图（DECSET 的 '?'、kitty 的 '>' 等）。
+fn hasInter(inter: u32, c: u8) bool {
+    return (inter >> @intCast(c - 0x20)) & 1 != 0;
 }
 
-fn classifyCsi(it: vt.Action.CSI) bool {
-    // kitty 键盘协议：CSI > flags u（push 开启）、CSI < n u（pop）、
-    // CSI = flags u（set 开启）、CSI ? u（查询）→ 全部丢弃，否则我们终端
-    // 会被开启 kitty 键盘模式，输入变成 CSI code;mods u 序列（实测 Ctrl+6
-    // 变成 CSI 54;5 u），前缀键 0x1e 再也收不到
-    if (it.final == 'u' and (contains(it.intermediates, '>') or contains(it.intermediates, '?') or
-        contains(it.intermediates, '=') or contains(it.intermediates, '<')))
+fn setInter(inter: *u32, c: u8) void {
+    inter.* |= @as(u32, 1) << @intCast(c - 0x20);
+}
+
+/// 8-bit C1 起始字节（与 7-bit ESC 前缀等价）。
+fn isStarter(c: u8) bool {
+    return c == 0x1b or c == 0x9b or c == 0x90 or c == 0x9d or c == 0x98 or c == 0x9e or c == 0x9f;
+}
+
+/// CSI 分类：true = 转发，false = 丢弃。
+fn classifyCsi(inter: u32, mode: u32, final: u8) bool {
+    // kitty 键盘协议：CSI [><=?] ... u（开启/设置/查询/pop）→ 丢弃，
+    // 否则我们终端会被开启 kitty 键盘模式，输入变成 CSI code;mods u
+    // 序列（实测 Ctrl+6 变成 CSI 54;5 u），前缀键 0x1e 再也收不到
+    if (final == 'u' and (hasInter(inter, '>') or hasInter(inter, '?') or
+        hasInter(inter, '=') or hasInter(inter, '<')))
         return false;
-    // modifyOtherKeys：CSI > 4 m / CSI > 4;2 m → 丢弃（改变我们终端的输入编码）
-    if (it.final == 'm' and contains(it.intermediates, '>')) return false;
+    // modifyOtherKeys：CSI > 4 m → 丢弃（改变我们终端的输入编码）
+    if (final == 'm' and hasInter(inter, '>')) return false;
     // DA1/DA2：CSI [?_] ... c → 丢弃
-    if (it.final == 'c') return false;
+    if (final == 'c') return false;
     // DSR/CPR：CSI [?_] ... n → 丢弃
-    if (it.final == 'n') return false;
+    if (final == 'n') return false;
     // XTVERSION（CSI > 0 q）与 DECRQM（CSI Ps $ q）→ 丢弃；DECSCUSR（CSI Ps q）转发
-    if (it.final == 'q' and (contains(it.intermediates, '>') or contains(it.intermediates, '$')))
+    if (final == 'q' and (hasInter(inter, '>') or hasInter(inter, '$')))
         return false;
     // DECRQM 查询：CSI Ps $ p → 丢弃
-    if (it.final == 'p' and contains(it.intermediates, '$')) return false;
+    if (final == 'p' and hasInter(inter, '$')) return false;
     // DECSET/DECRST（CSI ? Ps h/l）：查丢弃表；纯渲染模式（25 光标、1049 备屏、
     // 2004 bracketed paste 等）原样转发
-    if ((it.final == 'h' or it.final == 'l') and contains(it.intermediates, '?')) {
-        const mode: u16 = if (it.params.len > 0) it.params[0] else 0;
+    if ((final == 'h' or final == 'l') and hasInter(inter, '?')) {
         for (drop_modes) |m| {
             if (mode == m) return false;
         }
@@ -62,35 +86,41 @@ fn classifyCsi(it: vt.Action.CSI) bool {
     return true;
 }
 
-fn classifyOsc(cmd: vt.osc.Command) bool {
-    // 查询：负载以 '?' 结尾（OSC 10/11/12/4/7/52/104/110-112/1337 ...;?）→ 丢弃
-    return !cmd.isQuery();
-}
-
-fn classifyDcs(it: vt.Action.DCS) bool {
+/// DCS 分类：true = 转发，false = 丢弃。
+fn classifyDcs(inter: u32, final: u8) bool {
     // DECRQSS（DCS $ q）与 XTGETTCAP（DCS + q）→ 丢弃；sixel 等其余转发
-    if (contains(it.intermediates, '$') and it.final == 'q') return false;
-    if (contains(it.intermediates, '+') and it.final == 'q') return false;
+    if (final == 'q' and (hasInter(inter, '$') or hasInter(inter, '+'))) return false;
     return true;
 }
 
 /// 镜像输出过滤器。
 /// 用法：逐字节 push，返回需要转发到我们终端的字节（null 表示丢弃）。
 pub const Filter = struct {
-    parser: vt.Parser,
     alloc: std.mem.Allocator,
-    /// 当前序列的缓存字节（从序列起始到终结符）。
+    /// 当前序列的缓存字节（从序列起始到当前字节）。
     pending: std.ArrayList(u8),
-    /// 当前序列的转发决定；null = 无决定（CAN 中止的残缺序列按转发处理）。
+    /// 当前序列的转发决定；null = 无决定（CAN 中止等残缺序列按转发处理）。
     forward: ?bool = null,
-    /// 丢弃模式下继续吞掉后续字节（如 kitty graphics 的大负载）。
+    /// kitty graphics 丢弃模式：继续吞掉后续字节直到序列结束。
     dropping: bool = false,
     /// 独立字节（ground→ground）返回用的稳定缓冲。
     one: [1]u8 = undefined,
 
+    state: State = .ground,
+    /// CSI/DCS 中间符掩码（0x20-0x3f 的位）。
+    inter: u32 = 0,
+    csi_sub: CsiSub = .entry,
+    /// CSI 第一个参数（DECSET 模式判定用）。
+    csi_param0: u32 = 0,
+    csi_have_param: bool = false,
+    csi_param_done: bool = false,
+    /// DCS 头部是否已终结（true = 负载中）。
+    dcs_done: bool = false,
+    /// APC 是否处于第一个负载字节（kitty graphics 探测）。
+    apc_first: bool = false,
+
     pub fn init(alloc: std.mem.Allocator) Filter {
         return .{
-            .parser = vt.init(),
             .alloc = alloc,
             .pending = .empty,
         };
@@ -98,85 +128,281 @@ pub const Filter = struct {
 
     pub fn deinit(self: *Filter) void {
         self.pending.deinit(self.alloc);
-        self.parser.deinit();
     }
 
     /// 返回需要写入我们终端的字节切片（指向内部缓存，下次 push 前有效），
     /// 或 null 表示丢弃。
     pub fn push(self: *Filter, c: u8) ?[]const u8 {
         if (self.dropping) {
-            self.applyActions(c);
+            self.step(c);
+            if (self.state == .ground) {
+                self.dropping = false;
+                self.forward = null;
+                self.pending.items.len = 0;
+            }
             return null;
         }
 
-        const prev = self.parser.state;
-        const actions = self.parser.next(c);
-
-        // 独立字节（ground→ground）：立即原样转发，不经过缓存
-        if (prev == .ground and self.parser.state == .ground) {
+        // 独立字节（ground→ground）：立即原样转发
+        if (self.state == .ground and !isStarter(c)) {
             self.one[0] = c;
             return self.one[0..1];
         }
 
-        // 序列字节：先缓存，dispatch 时再决定
-        const before_len = self.pending.items.len;
-        self.pending.append(self.alloc, c) catch |err| {
-            log.err("pending 追加失败: {any}", .{err});
-            return null;
-        };
-
-        for (actions) |a| {
-            const act = a orelse continue;
-            switch (act) {
-                .csi_dispatch => |it| self.forward = classifyCsi(it),
-                // 注意：不能设置 forward=true —— ESC \ (ST) 也会触发 esc_dispatch，
-                // 会覆盖 OSC/DCS 序列的丢弃决定；默认 null 已按转发处理。
-                .osc_dispatch => |cmd| self.forward = classifyOsc(cmd),
-                .dcs_hook => |d| self.forward = classifyDcs(d),
-                .apc_start => self.forward = null,
-                .apc_put => |b| {
-                    // kitty graphics：APC 第一个负载字节是 'G'。
-                    // before_len 是追加前的长度：7-bit 形式已有 ESC _（2），
-                    // 8-bit 形式已有 0x9F（1）。
-                    const is_gfx_start = b == 'G' and
-                        ((before_len == 2 and self.pending.items[0] == 0x1b and
-                        self.pending.items[1] == '_') or
-                        (before_len == 1 and self.pending.items[0] == 0x9f));
-                    if (is_gfx_start) {
-                        self.forward = false;
-                        self.dropping = true;
-                        // 丢弃已开始的序列字节（ESC _ G），避免泄漏到下一个序列
-                        self.pending.items.len = 0;
-                        return null;
-                    }
-                },
-                .dcs_unhook, .apc_end => {},
-                else => {},
-            }
+        // 先跑状态机（分类基于追加前的缓存），再缓存本字节
+        self.step(c);
+        if (!self.dropping) {
+            self.pending.append(self.alloc, c) catch |err| {
+                log.err("pending 追加失败: {any}", .{err});
+            };
         }
 
-        // 序列结束（回到 ground，如终结符 BEL/ESC\ 或 CAN 中止）→ 按决定转发/丢弃。
-        // 注意：不能在此调用 clearRetainingCapacity()，它会 memset 抹掉缓冲，
-        // 返回的切片在调用方写入前必须保持有效；直接复位长度即可。
-        // forward 必须一并复位，否则上一个序列的决定（如丢弃）会泄漏到
-        // 下一个序列（如 UTF-8 多字节）的 ground 返回路径。
-        if (prev != .ground and self.parser.state == .ground) {
+        // 序列结束（回到 ground）→ 按决定整体转发/丢弃。
+        // 注意：不能 clearRetainingCapacity()，返回的切片在调用方写入前
+        // 必须保持有效；直接复位长度即可。forward 必须一并复位，否则上一个
+        // 序列的决定（如丢弃）会泄漏到下一个序列。
+        if (self.state == .ground) {
             const result: ?[]const u8 = if (self.forward orelse true) self.pending.items else null;
             self.pending.items.len = 0;
             self.forward = null;
             return result;
         }
-
         return null;
     }
 
-    /// 丢弃模式下仍要喂解析器保持状态同步；回到 ground 即序列结束。
-    fn applyActions(self: *Filter, c: u8) void {
-        _ = self.parser.next(c);
-        if (self.parser.state == .ground) {
-            self.dropping = false;
-            self.forward = null;
-            self.pending.items.len = 0;
+    fn step(self: *Filter, c: u8) void {
+        switch (self.state) {
+            .ground => switch (c) {
+                '[', 0x9b => self.enterCsi(),
+                ']', 0x9d => self.enterOsc(),
+                'P', 0x90 => self.enterDcs(),
+                '_', '^', 'X', 0x98, 0x9e, 0x9f => self.enterApc(),
+                0x1b => self.state = .escape,
+                else => unreachable, // push 保证是起始字节
+            },
+            .escape => self.stepEscape(c),
+            .csi => self.stepCsi(c),
+            .dcs => self.stepDcs(c),
+            .osc => self.stepOsc(c),
+            .apc => self.stepApc(c),
+        }
+    }
+
+    fn enterCsi(self: *Filter) void {
+        self.state = .csi;
+        self.inter = 0;
+        self.csi_sub = .entry;
+        self.csi_param0 = 0;
+        self.csi_have_param = false;
+        self.csi_param_done = false;
+    }
+
+    fn enterDcs(self: *Filter) void {
+        self.state = .dcs;
+        self.inter = 0;
+        self.dcs_done = false;
+    }
+
+    fn enterOsc(self: *Filter) void {
+        self.state = .osc;
+    }
+
+    fn enterApc(self: *Filter) void {
+        self.state = .apc;
+        self.apc_first = true;
+    }
+
+    fn stepEscape(self: *Filter, c: u8) void {
+        // 序列起始（含 8-bit C1 形式）
+        if (c == '[' or c == 0x9b) return self.enterCsi();
+        if (c == ']' or c == 0x9d) return self.enterOsc();
+        if (c == 'P' or c == 0x90) return self.enterDcs();
+        if (c == '_' or c == '^' or c == 'X' or c == 0x98 or c == 0x9e or c == 0x9f)
+            return self.enterApc();
+        // 停留：ESC、中间符 0x20-0x2f、C0 控制符（0x1a SUB 除外）、DEL、0xa0+
+        if (c == 0x1b or c == 0x7f or (c >= 0x20 and c <= 0x2f) or c <= 0x17 or
+            c == 0x19 or (c >= 0x1c and c <= 0x1f) or c >= 0xa0) return;
+        // 其余（esc_dispatch、CAN/SUB 中止、8-bit ST/C1）→ 序列结束
+        self.state = .ground;
+    }
+
+    fn stepCsi(self: *Filter, c: u8) void {
+        // final：分类后回 ground
+        if (c >= 0x40 and c <= 0x7e) {
+            if (self.csi_sub != .ignore)
+                self.forward = classifyCsi(self.inter, if (self.csi_have_param) self.csi_param0 else 0, c);
+            self.state = .ground;
+            return;
+        }
+        // 8-bit 起始/中止（anywhere 规则；0x90/0x98 与 0x80-0x9a 重叠，先判起始）
+        switch (c) {
+            0x9b => return self.enterCsi(), // 新 CSI：旧 CSI 不分类，缓冲合并
+            0x90 => return self.enterDcs(),
+            0x9d => return self.enterOsc(),
+            0x98, 0x9e, 0x9f => return self.enterApc(),
+            else => {},
+        }
+        // 新 ESC 开始：旧 CSI 中止（不分类）
+        if (c == 0x1b) {
+            self.state = .escape;
+            return;
+        }
+        // CAN/SUB、8-bit ST、其余 C1 → 序列中止
+        if (c == 0x18 or c == 0x1a or c == 0x9c or (c >= 0x80 and c <= 0x9a)) {
+            self.state = .ground;
+            return;
+        }
+        // 停留：C0、DEL、0xa0+
+        if (c == 0x7f or c <= 0x17 or c == 0x19 or (c >= 0x1c and c <= 0x1f) or c >= 0xa0) return;
+
+        // 0x20-0x3f：按子状态处理
+        switch (self.csi_sub) {
+            .entry => {
+                if (c >= 0x20 and c <= 0x2f) {
+                    setInter(&self.inter, c);
+                } else if (c >= 0x3c and c <= 0x3f) {
+                    // 私有标记（< = > ?）：进中间符，进入参数态
+                    setInter(&self.inter, c);
+                    self.csi_sub = .param;
+                } else if (c == 0x3a) {
+                    self.csi_sub = .ignore;
+                } else {
+                    // 0x30-0x39 数字、0x3b ';'
+                    self.csi_sub = .param;
+                    self.csiDigit(c);
+                }
+            },
+            .param => {
+                if (c >= 0x20 and c <= 0x2f) {
+                    setInter(&self.inter, c);
+                    self.csi_sub = .intermediate;
+                } else if (c >= 0x3c and c <= 0x3f) {
+                    self.csi_sub = .ignore;
+                } else {
+                    // 0x30-0x39 数字、0x3a ':'、0x3b ';'
+                    self.csiDigit(c);
+                }
+            },
+            .intermediate => {
+                if (c >= 0x20 and c <= 0x2f) {
+                    setInter(&self.inter, c);
+                } else {
+                    // 0x30-0x3f
+                    self.csi_sub = .ignore;
+                }
+            },
+            .ignore => {},
+        }
+    }
+
+    /// 只跟踪第一个参数（DECSET 模式判定用），其余参数忽略。
+    fn csiDigit(self: *Filter, c: u8) void {
+        if (c == ';' or c == ':') {
+            if (!self.csi_have_param) {
+                self.csi_param0 = 0;
+                self.csi_have_param = true;
+            }
+            self.csi_param_done = true;
+        } else if (!self.csi_param_done) {
+            self.csi_param0 = self.csi_param0 * 10 + (c - '0');
+            self.csi_have_param = true;
+        }
+    }
+
+    fn stepDcs(self: *Filter, c: u8) void {
+        if (self.dcs_done) {
+            // 负载：ST/CAN/任意字节结束
+            switch (c) {
+                0x9b => self.enterCsi(),
+                0x90 => self.enterDcs(),
+                0x9d => self.enterOsc(),
+                0x98, 0x9e, 0x9f => self.enterApc(),
+                0x1b => self.state = .escape,
+                0x18, 0x1a, 0x9c, 0x80...0x8f, 0x91...0x97, 0x99, 0x9a => self.state = .ground,
+                else => {}, // 负载字节
+            }
+            return;
+        }
+        // 头部：final 到达时分类
+        if (c >= 0x40 and c <= 0x7e) {
+            self.forward = classifyDcs(self.inter, c);
+            self.dcs_done = true;
+            return;
+        }
+        switch (c) {
+            0x20...0x2f, 0x3c...0x3f => setInter(&self.inter, c),
+            0x9b => self.enterCsi(),
+            0x90 => self.enterDcs(),
+            0x9d => self.enterOsc(),
+            0x98, 0x9e, 0x9f => self.enterApc(),
+            0x1b => self.state = .escape,
+            0x18, 0x1a, 0x9c, 0x80...0x8f, 0x91...0x97, 0x99, 0x9a => self.state = .ground,
+            else => {}, // 参数 0x30-0x3b、C0、DEL、0xa0+
+        }
+    }
+
+    fn stepOsc(self: *Filter, c: u8) void {
+        // 终结/中止：先分类（负载末尾是否 '?'），再切换状态
+        switch (c) {
+            0x9b => {
+                self.classifyOsc();
+                self.enterCsi();
+            },
+            0x90 => {
+                self.classifyOsc();
+                self.enterDcs();
+            },
+            0x9d => {
+                self.classifyOsc();
+                self.enterOsc();
+            },
+            0x98, 0x9e, 0x9f => {
+                self.classifyOsc();
+                self.enterApc();
+            },
+            0x1b => {
+                self.classifyOsc();
+                self.state = .escape;
+            },
+            0x07, 0x18, 0x1a, 0x9c, 0x80...0x8f, 0x91...0x97, 0x99, 0x9a => {
+                self.classifyOsc();
+                self.state = .ground;
+            },
+            else => {}, // 负载字节（含 C0、DEL、0xa0+）
+        }
+    }
+
+    /// OSC 查询（负载以 '?' 结尾，如 "11;?"、"52;c;?"）→ 丢弃。
+    fn classifyOsc(self: *Filter) void {
+        self.forward = !(self.pending.items.len > 0 and
+            self.pending.items[self.pending.items.len - 1] == '?');
+    }
+
+    fn stepApc(self: *Filter, c: u8) void {
+        // 第一个负载字节：探测 kitty graphics。
+        // 7-bit 形式已有 ESC _（2 字节），8-bit 形式已有 0x9f（1 字节）。
+        if (self.apc_first) {
+            self.apc_first = false;
+            const n = self.pending.items.len; // 尚未包含 c
+            if (c == 'G' and ((n == 2 and self.pending.items[0] == 0x1b and
+                self.pending.items[1] == '_') or
+                (n == 1 and self.pending.items[0] == 0x9f)))
+            {
+                // kitty graphics：丢弃整个负载
+                self.forward = false;
+                self.dropping = true;
+                self.pending.items.len = 0;
+                return;
+            }
+        }
+        switch (c) {
+            0x9b => self.enterCsi(),
+            0x90 => self.enterDcs(),
+            0x9d => self.enterOsc(),
+            0x98, 0x9e, 0x9f => self.enterApc(),
+            0x1b => self.state = .escape,
+            0x18, 0x1a, 0x9c, 0x80...0x8f, 0x91...0x97, 0x99, 0x9a => self.state = .ground,
+            else => {}, // 负载字节
         }
     }
 };
@@ -326,7 +552,7 @@ pub const Input = struct {
     }
 };
 
-/// 解析 kitty 键事件负载（如 "ESC[54;5u" / "ESC[54:55:54;5:1;120u"）：
+/// 解析 kitty 键事件负载（如 "ESC[54;5u" / "ESC[54:55;54;5:1;120u"）：
 /// 返回 key code 与 mods，非事件格式返回 null。
 fn parseKittyEvent(seq: []const u8) ?Input.Key {
     // 跳过 ESC 与 '['
@@ -457,8 +683,17 @@ test "丢弃：kitty graphics 不影响周围内容" {
     try expectOut("a\x1b_Gx;y\x1b\\b\x1b_Gz;w\x1b\\c", "abc");
 }
 
-// ---- Input 解码器回归测试 ----
+test "序列合并：中止后接新序列按整体分类" {
+    try expectDrop("\x1b[12\x1b[6n"); // CSI 内 ESC 中止，合并成查询
+    try expectDrop("\x1b]11;?\x1b[6n"); // OSC 查询后被新 CSI 取代
+}
 
+test "序列合并：私有标记出现在参数之后按非法处理" {
+    try expectForward("\x1b[?1006>h"); // csi_ignore → 无分类 → 转发
+    try expectForward("\x1b[1>u");
+}
+
+/// Input 解码器测试辅助：逐字节喂入，收集 payload 与事件类型。
 fn inputEvents(input: []const u8, alloc: std.mem.Allocator) !struct {
     payloads: std.ArrayList(u8),
     kinds: std.ArrayList(Input.Event.Tag),

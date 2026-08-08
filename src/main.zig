@@ -50,14 +50,12 @@ const Event = extern struct {
 const State = struct {
     io: Io,
     filter: *filter_mod.Filter,
-    samples: usize = 0,
 };
 
 /// ring buffer 回调：把被控 tty 的输出经过滤后写到自己的终端。
 fn onRingSample(ctx: ?*anyopaque, data: ?*const anyopaque, size: usize) callconv(.c) c_int {
     _ = size;
     const state: *State = @ptrCast(@alignCast(ctx.?));
-    state.samples += 1;
     const event: *const Event = @ptrCast(@alignCast(data.?));
     const bytes = event.data[0..@intCast(event.len)];
     for (bytes) |b| {
@@ -203,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
     var buf: [1]u8 = undefined;
     var input_dec = filter_mod.Input{};
     var prefix_wait = false;
-    var prefix_bytes: [8]u8 = undefined;
+    var prefix_bytes: [64]u8 = undefined; // kitty 事件负载最长 64 字节
     var prefix_len: usize = 0;
 
     var fds = [_]posix.pollfd{
