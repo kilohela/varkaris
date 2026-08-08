@@ -23,6 +23,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            // Required: libbpf is built against glibc and accesses glibc's
+            // TLS variables (%fs: negative offsets). Without linking libc the
+            // binary has no PT_TLS segment, ld.so doesn't lay out the shared
+            // library's static TLS area, and libbpf segfaults inside
+            // __snprintf_chk (observed: SIGSEGV at mov %fs:(%rax),%eax).
             .link_libc = true,
         }),
     });
