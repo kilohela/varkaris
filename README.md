@@ -2,7 +2,7 @@
 
 Mirrors the output of a controlled terminal (physical tty or pty) to your own
 terminal in real time, and injects your keystrokes into the controlled
-terminal.
+terminal. **This project runs on x86-64 Linux only**.
 
 ## How it works
 
