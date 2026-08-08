@@ -15,6 +15,10 @@ const PREFIX: u8 = 0x1e;
 const EXIT_KEY: u8 = 'x';
 /// 前缀等待下一个键的超时（ms），超时则把 prefix 本身转发给受控端。
 const PREFIX_TIMEOUT_MS: i32 = 1000;
+/// 挂起字节（ESC 等 '['、残缺 CSI 序列）的极短超时（ms）：转义序列的
+/// 字节流间隔远小于人类按键间隔，超时说明 ESC 是独立按键，转发它。
+/// 否则 vim 里 ESC 后的第一个键会被当成序列字节吞掉。
+const ESC_TIMEOUT_MS: i32 = 50;
 
 // ---- libbpf 绑定（手写 extern，避免 @cImport）----
 
@@ -210,14 +214,18 @@ pub fn main(init: std.process.Init) !void {
     };
 
     while (true) {
-        const timeout_ms: i32 = if (prefix_wait) PREFIX_TIMEOUT_MS else -1;
+        const timeout_ms: i32 = if (prefix_wait) PREFIX_TIMEOUT_MS
+        else if (input_dec.pending()) ESC_TIMEOUT_MS
+        else -1;
         const nfds = posix.poll(&fds, timeout_ms) catch continue;
 
-        // 前缀超时：用户只按了 prefix，把它本身转发给受控端
+        // 超时：prefix 单独按下，或 ESC/残缺序列挂起 → 独立转发
         if (nfds == 0) {
             if (prefix_wait) {
                 prefix_wait = false;
                 try injectBytes(tty, io, prefix_bytes[0..prefix_len]);
+            } else if (input_dec.pending()) {
+                try injectBytes(tty, io, input_dec.flush());
             }
             continue;
         }
@@ -268,4 +276,9 @@ pub fn main(init: std.process.Init) !void {
             _ = ring_buffer__consume(rb);
         }
     }
+}
+
+// Zig 0.16 的测试只执行根文件的 test 块，必须显式引用模块才能跑其中的测试。
+test {
+    _ = @import("filter.zig");
 }

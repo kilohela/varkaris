@@ -425,13 +425,16 @@ fn isPrefixKey(code: u32, mods: u32) bool {
     return code == 0x36 or code == 0x1e;
 }
 
-/// 输入解码器：逐字节喂入，识别 kitty 键事件；其余原样透传。
+/// 输入解码器：逐字节喂入，识别 kitty 键事件与 UTF-8 多字节；其余原样透传。
 pub const Input = struct {
     /// 状态机缓冲（CSI ... u 序列，kitty 事件不会太长）。
     buf: [64]u8 = undefined,
     len: usize = 0,
     /// 是否出现了中间符（0x20-0x2f）——带中间符的 'u' 是应答/协商而非键事件。
     has_intermediates: bool = false,
+    /// UTF-8 多字节序列剩余连续字节数（连续字节 0x80-0x9f 与 C1 控制字符区
+    /// 重叠，必须按 UTF-8 语境区分，否则中文会被误判为 8-bit CSI 等）。
+    utf8_left: u8 = 0,
 
     pub const Key = struct {
         code: u32,
@@ -440,6 +443,8 @@ pub const Input = struct {
     };
 
     pub const Event = union(enum) {
+        pub const Tag = std.meta.FieldEnum(Event);
+
         /// 原样转发（payload 指向内部缓冲，下次 push 前有效）。
         forward: []const u8,
         /// kitty 键事件：原样转发 payload（prefix 检测已在内部完成）。
@@ -448,9 +453,35 @@ pub const Input = struct {
         prefix: []const u8,
     };
 
+    /// 是否有挂起字节等待转发（ESC 等 '[' 或残缺 CSI 序列）。调用方应据此
+    /// 设置极短 poll 超时，超时后调用 flush() 把挂起字节独立转发。
+    pub fn pending(self: *const Input) bool {
+        return self.len > 0;
+    }
+
+    /// 清空并返回挂起的字节（指向内部缓冲，下次 push 前有效）。
+    pub fn flush(self: *Input) []const u8 {
+        const seq = self.buf[0..self.len];
+        self.len = 0;
+        return seq;
+    }
+
     pub fn push(self: *Input, c: u8) Event {
         switch (self.len) {
             0 => {
+                if (self.utf8_left > 0) {
+                    // UTF-8 连续字节：原样转发（0x80-0x9f 按 UTF-8 处理，不是 C1）
+                    self.utf8_left -= 1;
+                    self.buf[0] = c;
+                    return .{ .forward = self.buf[0..1] };
+                }
+                if (c >= 0xc0) {
+                    // UTF-8 多字节起始：0xC0-0xDF → 1 个连续字节，
+                    // 0xE0-0xEF → 2 个，0xF0-0xFF → 3 个
+                    self.utf8_left = if (c >= 0xf0) 3 else if (c >= 0xe0) 2 else 1;
+                    self.buf[0] = c;
+                    return .{ .forward = self.buf[0..1] };
+                }
                 if (c == 0x1b) {
                     self.buf[0] = c;
                     self.len = 1;
@@ -470,27 +501,49 @@ pub const Input = struct {
                 return .{ .forward = self.buf[0..1] };
             },
             1 => {
-                // 刚收到 ESC，等 '['；否则 flush ESC 并重处理本字节
-                if (c == '[') {
+                // 已收到起始字节（ESC 等 '[' 或 8-bit CSI 0x9b 等序列内容）
+                const started = self.buf[0];
+                if (started == 0x1b and c == '[') {
+                    // 7-bit CSI 序列开始
                     self.buf[1] = c;
                     self.len = 2;
                     self.has_intermediates = false;
                     return .{ .forward = &.{} };
                 }
                 if (c == 0x18 or c == 0x1a) { // CAN/SUB 中止
-                    self.buf[0] = 0x1b;
+                    self.buf[0] = started;
                     self.buf[1] = c;
                     self.len = 0;
                     return .{ .forward = self.buf[0..2] };
                 }
-                // 非 CSI 的 ESC 序列（ESC 7、ESC O A 等）整体原样转发，
-                // 该字节本身若又是 ESC 则从 ESC 状态继续
-                self.len = 0;
-                if (c == 0x1b) {
-                    self.buf[0] = 0x1b;
-                    self.len = 1;
+                if (started == 0x9b) {
+                    // 8-bit CSI：本字节按序列内容处理
+                    if (c >= 0x20 and c <= 0x3f) { // 参数/中间符
+                        self.buf[1] = c;
+                        self.len = 2;
+                        return .{ .forward = &.{} };
+                    }
+                    if (c >= 0x40 and c <= 0x7e) { // final
+                        self.buf[1] = c;
+                        const seq = self.buf[0..2];
+                        self.len = 0;
+                        if (c == 'u' and !self.has_intermediates) {
+                            if (parseKittyEvent(seq)) |key| {
+                                if (isPrefixKey(key.code, key.mods)) return .{ .prefix = key.payload };
+                                return .{ .key = key };
+                            }
+                        }
+                        return .{ .forward = seq };
+                    }
                 }
-                return .{ .forward = self.buf[0..1] };
+                // ESC 后非 '['（或 0x9b 后非常规字节）：ESC 与本字节整体
+                // 转发（不能吞掉后到的键，否则 vim 里 ESC 后的冒号会失效）
+                self.buf[1] = c;
+                self.len = 0;
+                if (c >= 0xc0) { // 本字节是 UTF-8 起始：后续连续字节不再被 C1 判定
+                    self.utf8_left = if (c >= 0xf0) 3 else if (c >= 0xe0) 2 else 1;
+                }
+                return .{ .forward = self.buf[0..2] };
             },
             else => {
                 // CSI 序列中
@@ -705,6 +758,8 @@ fn inputEvents(input: []const u8, alloc: std.mem.Allocator) !struct {
         const ev = dec.push(b);
         switch (ev) {
             .forward => |bytes| {
+                // 空 payload（ESC 挂起、序列中途）不构成事件，跳过
+                if (bytes.len == 0) continue;
                 try payloads.appendSlice(alloc, bytes);
                 try kinds.append(alloc, .forward);
             },
@@ -722,15 +777,83 @@ fn inputEvents(input: []const u8, alloc: std.mem.Allocator) !struct {
 }
 
 test "Input: 普通字节直通" {
-    const r = try inputEvents("hello\x0d\x0a", testing.allocator);
+    var r = try inputEvents("hello\x0d\x0a", testing.allocator);
     defer r.payloads.deinit(testing.allocator);
     defer r.kinds.deinit(testing.allocator);
     try testing.expectEqualStrings("hello\x0d\x0a", r.payloads.items);
     for (r.kinds.items) |k| try testing.expectEqual(.forward, k);
 }
 
+test "Input: UTF-8 中文（连续字节与 C1 区重叠）" {
+    // 监 = E7 9B 91（0x9B 恰为 8-bit CSI，0x91 在 C1 区）
+    var r = try inputEvents("\xe7\x9b\x91", testing.allocator);
+    defer r.payloads.deinit(testing.allocator);
+    defer r.kinds.deinit(testing.allocator);
+    try testing.expectEqualStrings("\xe7\x9b\x91", r.payloads.items);
+
+    // 你好 = E4 BD A0 E5 A5 BD
+    var r2 = try inputEvents("\xe4\xbd\xa0\xe5\xa5\xbd", testing.allocator);
+    defer r2.payloads.deinit(testing.allocator);
+    defer r2.kinds.deinit(testing.allocator);
+    try testing.expectEqualStrings("\xe4\xbd\xa0\xe5\xa5\xbd", r2.payloads.items);
+
+    // emoji 4 字节 F0 9F 98 83（0x9F/0x98 均为 8-bit 起始字节）
+    var r3 = try inputEvents("\xf0\x9f\x98\x83", testing.allocator);
+    defer r3.payloads.deinit(testing.allocator);
+    defer r3.kinds.deinit(testing.allocator);
+    try testing.expectEqualStrings("\xf0\x9f\x98\x83", r3.payloads.items);
+}
+
+test "Input: UTF-8 与 ASCII 交错" {
+    var r = try inputEvents("a\xe7\x9b\x91b", testing.allocator);
+    defer r.payloads.deinit(testing.allocator);
+    defer r.kinds.deinit(testing.allocator);
+    try testing.expectEqualStrings("a\xe7\x9b\x91b", r.payloads.items);
+}
+
+test "Input: ESC 后跟普通键整体转发" {
+    // vim: ESC 后按 :（0x3a 不是 CSI 起始，不能吞）
+    var r = try inputEvents("\x1b:", testing.allocator);
+    defer r.payloads.deinit(testing.allocator);
+    defer r.kinds.deinit(testing.allocator);
+    try testing.expectEqualStrings("\x1b:", r.payloads.items);
+
+    // ESC j（vim 移动）
+    var r2 = try inputEvents("\x1bj", testing.allocator);
+    defer r2.payloads.deinit(testing.allocator);
+    defer r2.kinds.deinit(testing.allocator);
+    try testing.expectEqualStrings("\x1bj", r2.payloads.items);
+
+    // ESC ESC
+    var r3 = try inputEvents("\x1b\x1b", testing.allocator);
+    defer r3.payloads.deinit(testing.allocator);
+    defer r3.kinds.deinit(testing.allocator);
+    try testing.expectEqualStrings("\x1b\x1b", r3.payloads.items);
+}
+
+test "Input: 挂起的 ESC 可超时 flush" {
+    var dec = Input{};
+    _ = dec.push(0x1b);
+    try testing.expect(dec.pending());
+    try testing.expectEqualStrings("\x1b", dec.flush());
+    try testing.expect(!dec.pending());
+
+    // 残缺 CSI（ESC[5）flush 原样返回
+    var dec2 = Input{};
+    _ = dec2.push(0x1b);
+    _ = dec2.push('[');
+    _ = dec2.push('5');
+    try testing.expect(dec2.pending());
+    try testing.expectEqualStrings("\x1b[5", dec2.flush());
+
+    // flush 后解码器状态复位
+    _ = dec2.push('x');
+    const ev = dec2.push('y');
+    try testing.expectEqual(Input.Event.Tag.forward, @as(Input.Event.Tag, ev));
+}
+
 test "Input: 裸 Ctrl+6 识别为前缀" {
-    const r = try inputEvents("\x1e", testing.allocator);
+    var r = try inputEvents("\x1e", testing.allocator);
     defer r.payloads.deinit(testing.allocator);
     defer r.kinds.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), r.kinds.items.len);
@@ -740,7 +863,7 @@ test "Input: 裸 Ctrl+6 识别为前缀" {
 
 test "Input: kitty 键事件识别" {
     // 用户实测：Ctrl+6 在 kitty 模式下为 ESC[54;5u
-    const r = try inputEvents("\x1b[54;5u", testing.allocator);
+    var r = try inputEvents("\x1b[54;5u", testing.allocator);
     defer r.payloads.deinit(testing.allocator);
     defer r.kinds.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), r.kinds.items.len);
@@ -748,7 +871,7 @@ test "Input: kitty 键事件识别" {
     try testing.expectEqualStrings("\x1b[54;5u", r.payloads.items);
 
     // 普通键：ESC[120;1u (x) → key 事件
-    const r2 = try inputEvents("\x1b[120;1u", testing.allocator);
+    var r2 = try inputEvents("\x1b[120;1u", testing.allocator);
     defer r2.payloads.deinit(testing.allocator);
     defer r2.kinds.deinit(testing.allocator);
     try testing.expectEqual(Input.Event.Tag.key, r2.kinds.items[0]);
@@ -756,14 +879,14 @@ test "Input: kitty 键事件识别" {
 
 test "Input: kitty 事件直通不受影响" {
     // 无 ctrl 的普通键事件 + 交错文本
-    const r = try inputEvents("a\x1b[97;1ub", testing.allocator);
+    var r = try inputEvents("a\x1b[97;1ub", testing.allocator);
     defer r.payloads.deinit(testing.allocator);
     defer r.kinds.deinit(testing.allocator);
     try testing.expectEqualStrings("a\x1b[97;1ub", r.payloads.items);
 }
 
 test "Input: 非 kitty 的 CSI 序列整体直通" {
-    const r = try inputEvents("x\x1b[25hy", testing.allocator);
+    var r = try inputEvents("x\x1b[25hy", testing.allocator);
     defer r.payloads.deinit(testing.allocator);
     defer r.kinds.deinit(testing.allocator);
     try testing.expectEqualStrings("x\x1b[25hy", r.payloads.items);
@@ -771,28 +894,28 @@ test "Input: 非 kitty 的 CSI 序列整体直通" {
 
 test "Input: kitty 事件带事件类型与文本段" {
     // ESC[54:54;5:1;54u —— alternate codes + 事件类型 + 文本段
-    const r = try inputEvents("\x1b[54:54;5:1;54u", testing.allocator);
+    var r = try inputEvents("\x1b[54:54;5:1;54u", testing.allocator);
     defer r.payloads.deinit(testing.allocator);
     defer r.kinds.deinit(testing.allocator);
     try testing.expectEqual(Input.Event.Tag.prefix, r.kinds.items[0]);
 }
 
 test "Input: 带中间符的 u（应答/协商）不算键事件" {
-    const r = try inputEvents("\x1b[?1u", testing.allocator);
+    var r = try inputEvents("\x1b[?1u", testing.allocator);
     defer r.payloads.deinit(testing.allocator);
     defer r.kinds.deinit(testing.allocator);
     try testing.expectEqual(Input.Event.Tag.forward, r.kinds.items[0]);
 }
 
 test "Input: 8-bit CSI kitty 事件" {
-    const r = try inputEvents("\x9b54;5u", testing.allocator);
+    var r = try inputEvents("\x9b54;5u", testing.allocator);
     defer r.payloads.deinit(testing.allocator);
     defer r.kinds.deinit(testing.allocator);
     try testing.expectEqual(Input.Event.Tag.prefix, r.kinds.items[0]);
 }
 
 test "Input: 交错 kitty 与普通输入" {
-    const r = try inputEvents("h\x1b[54;5ui\x1b[120;1u", testing.allocator);
+    var r = try inputEvents("h\x1b[54;5ui\x1b[120;1u", testing.allocator);
     defer r.payloads.deinit(testing.allocator);
     defer r.kinds.deinit(testing.allocator);
     try testing.expectEqualStrings("h\x1b[54;5ui\x1b[120;1u", r.payloads.items);
