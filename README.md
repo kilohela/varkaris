@@ -47,9 +47,11 @@ sudo zig-out/bin/varkaris /dev/pts/3 -c "chafa /tmp/img.png"  # non-interactive:
   point (`n_tty_write`) sits at the point of generation, so events can be
   dropped when the ring is full, and the captured content differs from what
   the emulator sees when OPOST is enabled
-- **No input echo in raw mode**: keystroke echo is generated internally by the
-  line discipline (`echo_buf` → driver `write`) and never passes through
-  `n_tty_write`, so it cannot be captured
+- **No support for the tty driver's own echo**: in line-buffered (canonical)
+  mode the kernel echoes keystrokes itself, straight from the tty driver —
+  this path never passes through `n_tty_write`, so the echo never reaches the
+  mirror. In raw mode the program usually echoes keystrokes itself (writes
+  them back to the tty), which is captured and mirrored normally
 - **No winsize sync**: the controlled side renders at its own column width;
   layouts (image sizes, wrapping) may misalign when widths differ
 - **No protocol negotiation with the controlling terminal**: varkaris does not
